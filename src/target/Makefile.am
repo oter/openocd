@@ -40,6 +40,7 @@ libtarget_la_SOURCES = \
 	dsp563xx.c \
 	dsp563xx_once.c \
 	dsp5680xx.c \
+	xtensa.c \
 	hla_target.c
 
 TARGET_CORE_SRC = \
@@ -186,6 +187,7 @@ noinst_HEADERS = \
 	target_request.h \
 	trace.h \
 	xscale.h \
+	xtensa.h \
 	smp.h \
 	avr32_ap7k.h \
 	avr32_jtag.h \
