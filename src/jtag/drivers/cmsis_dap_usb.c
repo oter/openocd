@@ -1,4 +1,4 @@
-#define CMSIS_DAP_JTAG_DEBUG
+//#define CMSIS_DAP_JTAG_DEBUG
 /***************************************************************************
  *   Copyright (C) 2016 by Phillip Pearson                                 *
  *   pp@myelin.co.nz                                                       *
@@ -321,6 +321,9 @@ static void cmsis_dap_usb_close(struct cmsis_dap *dap)
 /* Send a message and receive the reply */
 static int cmsis_dap_usb_xfer(struct cmsis_dap *dap, int txlen)
 {
+#ifdef CMSIS_DAP_JTAG_DEBUG
+	LOG_DEBUG("cmsis-dap usb xfer cmd=%02X", dap->packet_buffer[1]);
+#endif
 	/* Pad the rest of the TX buffer with 0's */
 	memset(dap->packet_buffer + txlen, 0, dap->packet_size - txlen);
 
@@ -395,6 +398,14 @@ static int cmsis_dap_cmd_DAP_SWJ_Sequence(uint8_t s_len, const uint8_t* sequence
 {
 	int retval;
 	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
+
+#ifdef CMSIS_DAP_JTAG_DEBUG
+	LOG_DEBUG("cmsis-dap TMS sequence: len=%d", s_len);
+	for (int i = 0; i < DIV_ROUND_UP(s_len, 8); ++i) {
+		printf("%02X ", sequence[i]);
+	}
+	printf("\n");
+#endif
 
 	buffer[0] = 0;	/* report number */
 	buffer[1] = CMD_DAP_SWJ_SEQ;
@@ -993,6 +1004,7 @@ static void cmsis_dap_end_state(tap_state_t state)
 	}
 }
 
+#ifdef CMSIS_DAP_JTAG_DEBUG
 static void sprint_binary(char* s, const uint8_t* buf, int offset, int len) {
 	if (!len) return;
 
@@ -1009,6 +1021,7 @@ static void sprint_binary(char* s, const uint8_t* buf, int offset, int len) {
 	}
 	*s = 0;
 }
+#endif
 
 /*
 static void bit_copy_debug(uint8_t *dst, unsigned dst_offset, const uint8_t *src, unsigned src_offset, unsigned bit_count) {
@@ -1072,7 +1085,6 @@ static void cmsis_dap_state_move()
 	 * move to a stable state first.
 	 */
 	bool exit_to_pause = false;
-	int extra_bit = 1;
 	switch (tap_get_state()) {
 	case TAP_DREXIT1:
 		// LOG_DEBUG("moving out of DREXIT1");
@@ -1090,12 +1102,20 @@ static void cmsis_dap_state_move()
 
 	uint8_t tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
 	int tms_count = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
+#ifdef CMSIS_DAP_JTAG_DEBUG
+	LOG_DEBUG("STATE MOVE %02X (%d clocks) to get from %s to %s",
+		tms_scan, tms_count,
+		tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()));
+#endif
 
 	if (exit_to_pause) {
-		/* need to shift in an extra bit before the usual sequence */
+		/* need to shift in an extra 0 before the usual sequence */
 		uint8_t scan[2];
-		scan[0] = (uint8_t)(tms_scan << 1) | extra_bit;
+		scan[0] = (uint8_t)(tms_scan << 1);
 		scan[1] = (uint8_t)(tms_scan >> 7);
+#ifdef CMSIS_DAP_JTAG_DEBUG
+		LOG_DEBUG("add in an extra 1 to get out of ?REXIT: now %02X (%d clocks)", scan[0], tms_count + 1);
+#endif
 		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count + 1, scan);
 	} else {
 		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count, &tms_scan);
@@ -1121,9 +1141,11 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 		cmsis_dap_end_state(saved_end_state);
 	}
 
+#ifdef CMSIS_DAP_JTAG_DEBUG
 	char debug[2000];
 	sprintf(debug, "%cR in ", ir_scan ? 'I' : 'D');
 	sprint_binary(debug + strlen(debug), sequence, 0, scan_size);
+#endif
 
 	/* Split scan up into 64-bit chunks and issue a new USB request for each one.  This is suboptimal,
 	 * but if we only use it for the inital scan chain enumeration, it doesn't matter.  If it turns out
@@ -1228,11 +1250,13 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 		}
 	}
 
+#ifdef CMSIS_DAP_JTAG_DEBUG
 	if (type == SCAN_IN || type == SCAN_IO) {
 		strcat(debug, " out ");
 		sprint_binary(debug + strlen(debug), sequence, 0, scan_size);
 	}
 	LOG_DEBUG("%s", debug);
+#endif
 
 	/* The final bit will have transitioned us to Exit1-DR or Exit1-IR */
 	tap_set_state(tap_get_state() == TAP_DRSHIFT ? TAP_DREXIT1 : TAP_IREXIT1);
