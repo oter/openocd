@@ -1,4 +1,7 @@
 /***************************************************************************
+ *   Copyright (C) 2016 by Phillip Pearson                                 *
+ *   pp@myelin.co.nz                                                       *
+ *                                                                         *
  *   Copyright (C) 2014 by Paul Fertser                                    *
  *   fercerpav@gmail.com                                                   *
  *                                                                         *
@@ -989,15 +992,58 @@ static void cmsis_dap_end_state(tap_state_t state)
 	}
 }
 
+static void print_binary(const uint8_t* buf, int offset, int len) {
+	for (int i = offset; i < offset + len; ++i) {
+		putchar((buf[i / 8] & (1 << (i % 8))) ? '1' : '0');
+	}
+}
+
+static void bit_copy_debug(uint8_t *dst, unsigned dst_offset, const uint8_t *src, unsigned src_offset, unsigned bit_count) {
+	LOG_INFO("bit copy dst_offset=%d src_offset=%d bit_count=%d", dst_offset, src_offset, bit_count);
+	print_binary(src, src_offset, bit_count);
+	LOG_INFO(" <-- bits");
+	bit_copy(dst, dst_offset, src, src_offset, bit_count);
+}
+
 /* Move to the end state by clocking bits into TMS as appropriate using
  * the CMSIS-DAP DAP_SWJ_Sequence command.
  */
 static void cmsis_dap_state_move()
 {
+	LOG_DEBUG("cmsis_dap_state_move from %s to %s", tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()));
+
+	/* tap_get_tms_path() can only handle moving between stable states, so if we're in an unstable state,
+	 * move to a stable state first.
+	 */
+	bool exit_to_pause = false;
+	int extra_bit = 1;
+	switch (tap_get_state()) {
+	case TAP_DREXIT1:
+		LOG_DEBUG("moving out of DREXIT1");
+		exit_to_pause = true;
+		tap_set_state(TAP_DRPAUSE);
+		break;
+	case TAP_IREXIT1:
+		LOG_DEBUG("moving out of IREXIT1");
+		exit_to_pause = true;
+		tap_set_state(TAP_IRPAUSE);
+		break;
+	default:
+		break;
+	}
+
 	uint8_t tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
 	int tms_count = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
 
-	cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count, &tms_scan);
+	if (exit_to_pause) {
+		/* need to shift in an extra bit before the usual sequence */
+		uint8_t scan[2];
+		scan[0] = (uint8_t)(tms_scan << 1) | extra_bit;
+		scan[1] = (uint8_t)(tms_scan >> 7);
+		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count + 1, &tms_scan);
+	} else {
+		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count, &tms_scan);
+	}
 
 	tap_set_state(tap_get_end_state());
 }
@@ -1019,66 +1065,95 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 		cmsis_dap_end_state(saved_end_state);
 	}
 
-	if (scan_size > 64) {
-		LOG_ERROR("Splitting > 64 bit scans into multiple sequences for CMSIS-DAP is not implemented");
-		exit(-1);
-	}
-
-	/* Prepare CMSIS-DAP JTAG Sequence command:
-	 *
-	 * #0 = 0 (report number)
-	 * #1 = CMD_DAP_JTAG_SEQ
-	 * #2 = number of sequences
-	 * #3 = sequence info 1
-	 * #4...4+n_bytes-1 = sequence 1
-	 * #4+n_bytes = sequence info 2
-	 * #5+n_bytes = sequence 2 (single bit)
-	 *
-	 * so a 32-bit sequence will go in #4-7, leaving #8 and #9 for sequence 2
+	/* Split scan up into 64-bit chunks and issue a new USB request for each one.  This is suboptimal,
+	 * but if we only use it for the inital scan chain enumeration, it doesn't matter.  If it turns out
+	 * that drivers habitually make long scan requests, modify this to pack as much as possible into
+	 * each USB request.
 	 */
-	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
-	uint8_t buf_ptr = 0;
-	buffer[buf_ptr++] = 0;	/* report number */
-	buffer[buf_ptr++] = CMD_DAP_JTAG_SEQ;
+	for (int scan_start = 0; scan_start < scan_size; scan_start += 64) {
 
-	if (scan_size == 0) {
-		LOG_ERROR("Empty scan");
-		exit(-1);
-	} else if (scan_size == 1) {
-		/* Just one sequence */
-		buffer[buf_ptr++] = 1;
-		/* Just clock out one bit with TMS=1 */
-		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
-		bit_copy(&buffer[buf_ptr++], 0, buffer, 0, 1);
-	} else {
-		/* Split our scan into two sequences, one with TMS=0 and (scan_size-1) bits, and one with TMS=0 and 1 bit. */
-		buffer[buf_ptr++] = 2;
+		/* If this is the last chunk, we need to set TMS when sending the final bit */
+		bool last_chunk = (scan_start + 64) >= scan_size;
+		/* Number of bits to send/receive in this chunk */
+		int chunk_bits = last_chunk ? (scan_size - scan_start) : 64;
+		LOG_INFO("cmsis-dap jtag chunk: scan_start %d scan_size %d chunk_bits %d last_chunk %d", scan_start, scan_size, chunk_bits, last_chunk ? 1 : 0);
 
-		/* Sequence 1 */
-		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | (scan_size - 1);
-		bit_copy(&buffer[buf_ptr], 0, buffer, 0, scan_size - 1);
+		/* Prepare CMSIS-DAP JTAG Sequence command:
+		 *
+		 * #0 = 0 (report number)
+		 * #1 = CMD_DAP_JTAG_SEQ
+		 * #2 = number of sequences
+		 * #3 = sequence info 1
+		 * #4...4+n_bytes-1 = sequence 1
+		 * #4+n_bytes = sequence info 2
+		 * #5+n_bytes = sequence 2 (single bit)
+		 *
+		 * so a 32-bit sequence will go in #4-7, leaving #8 and #9 for sequence 2
+		 */
+		uint8_t *buffer = cmsis_dap_handle->packet_buffer;
+		buffer[0] = 0;	/* report number */
+		buffer[1] = CMD_DAP_JTAG_SEQ;
+		buffer[2] = 1; /* default 1 sequence */
+		uint8_t buf_ptr = 3; /* data blocks start at buffer[3] */
+		uint8_t first_seq_start = 4; /* start of first buffer */
+		uint8_t second_seq_start = 0; /* start of second data buffer if we use one */
 
-		/* Figure out how many bytes we just used in the buffer */
-		buf_ptr += ((scan_size - 1) + 7) / 8;
+		LOG_INFO("setup chunk");
+		if (chunk_bits == 0) {
+			LOG_ERROR("BUG: Empty scan chunk");
+			exit(-1);
+		} else if (chunk_bits > 64) {
+			LOG_ERROR("BUG: Scan chunk > 64 bits");
+			exit(-1);
+		} else if (!last_chunk) {
+			/* We're only sending part of the scan request, so don't raise TMS on the final bit */
+			/* 64 bits with TMS=0 */
+			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO;
+			/* copying 64 bits from sequence, starting at scan_start, into buffer[3...] */
+			bit_copy_debug(&buffer[buf_ptr++], 0, sequence, scan_start, 64);
+		} else if (chunk_bits == 1) {
+			/* Just clock out one bit with TMS=1 */
+			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
+			bit_copy_debug(&buffer[buf_ptr++], 0, sequence, scan_start, 1);
+		} else {
+			/* Split our scan into two sequences, one with TMS=0 and (scan_size-1) bits, and one with TMS=0 and 1 bit. */
+			buffer[2] = 2;
 
-		/* Sequence 2: the final bit */
-		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
-		bit_copy(&buffer[buf_ptr++], 0, sequence, scan_size - 1, 1);
-	}
+			/* Sequence 1 */
+			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | (chunk_bits - 1);
+			bit_copy_debug(&buffer[buf_ptr], 0, sequence, scan_start, chunk_bits - 1);
 
-	/* Send command */
-	int retval = cmsis_dap_usb_xfer(cmsis_dap_handle, buf_ptr);
+			/* Figure out how many bytes we just used in the buffer */
+			buf_ptr += ((chunk_bits - 1) + 7) / 8;
 
-	if (retval != ERROR_OK || buffer[1] != DAP_OK) {
-		LOG_ERROR("CMSIS-DAP command CMD_DAP_JTAG_SEQ failed.");
-		return ERROR_JTAG_DEVICE_ERROR;
-	}
+			/* Sequence 2: the final bit */
+			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
+			second_seq_start = buf_ptr;
+			bit_copy_debug(&buffer[buf_ptr++], 0, sequence, scan_start + chunk_bits - 1, 1);
+		}
 
-	/* Copy results into the sequence buffer if we want them */
-	if (type == SCAN_IN || type == SCAN_IO) {
-		bit_copy(sequence, 0, &buffer[4], 0, (scan_size == 1) ? 1 : (scan_size - 1));
-		if (scan_size > 1) {
-			bit_copy(sequence, scan_size - 1, &buffer[5 + (scan_size - 1 + 7) / 8], 0, 1);
+		/* Send command */
+		int retval = cmsis_dap_usb_xfer(cmsis_dap_handle, buf_ptr);
+
+		if (retval != ERROR_OK || buffer[1] != DAP_OK) {
+			LOG_ERROR("CMSIS-DAP command CMD_DAP_JTAG_SEQ failed.");
+			return ERROR_JTAG_DEVICE_ERROR;
+		}
+
+		/* Copy results into the sequence buffer if we want them */
+		if (type == SCAN_IN || type == SCAN_IO) {
+			LOG_INFO("copy scan results out");
+			if (!last_chunk) {
+				/* 64 bit chunk, single sequence */
+				bit_copy_debug(sequence, scan_start, &buffer[first_seq_start], 0, 64);
+			} else if (chunk_bits == 1) {
+				/* 1 bit chunk, single sequence */
+				bit_copy_debug(sequence, scan_start, &buffer[first_seq_start], 0, 1);
+			} else {
+				/* last chunk, two sequences */
+				bit_copy_debug(sequence, scan_start, &buffer[first_seq_start], 0, chunk_bits - 1);
+				bit_copy_debug(sequence, scan_start + chunk_bits - 1, &buffer[second_seq_start], 0, 1);
+			}
 		}
 	}
 
@@ -1094,7 +1169,6 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 
 static int cmsis_dap_execute_scan(struct jtag_command *cmd)
 {
-	LOG_INFO("cmsis-dap JTAG SCAN");
 #ifdef _DEBUG_JTAG_IO_
 	LOG_DEBUG("%s scan end in %s",
 			(cmd->cmd.scan->ir_scan) ? "IR" : "DR",
