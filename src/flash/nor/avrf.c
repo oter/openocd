@@ -151,6 +151,14 @@ static int avr_jtagprg_writeflashpage(struct avr_common *avr,
 {
 	uint32_t i, poll_value;
 
+	for (i = 0; i < page_size && i < buf_size; ++i) {
+		if (page_buf[i] != 0xFF) break;
+	}
+	if (i == page_size || i == buf_size) {
+		/* entire page unprogrammed -- skip it */
+		return ERROR_OK;
+	}
+
 	avr_jtag_sendinstr(avr->jtag_info.tap, NULL, AVR_JTAG_INS_PROG_COMMANDS);
 	avr_jtag_senddat(avr->jtag_info.tap, NULL, 0x2310, AVR_JTAG_REG_ProgrammingCommand_Len);
 
