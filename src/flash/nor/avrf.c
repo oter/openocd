@@ -73,6 +73,7 @@ static const struct avrf_type avft_chips_info[] = {
 	{"atmega164p", 0x940a, 128, 128, 4, 128},
 	{"atmega324p", 0x9508, 128, 256, 4, 256},
 	{"atmega324pa", 0x9511, 128, 256, 4, 256},
+	{"atmega32u4", 0x9587, 128, 256, 8, 128},
 	{"atmega644p", 0x960a, 256, 256, 8, 256},
 	{"atmega1284p", 0x9705, 256, 512, 8, 512},
 };
