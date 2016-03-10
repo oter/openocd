@@ -151,7 +151,9 @@ static int avr_deassert_reset(struct target *target)
 int avr_jtag_senddat(struct jtag_tap *tap, uint32_t* dr_in, uint32_t dr_out,
 		int len)
 {
+#ifdef DEBUG_AVR_VERBOSE
 	LOG_DEBUG("avr send data %X", (dr_out & ((1<<len) - 1)));
+#endif
 	return mcu_write_dr_u32(tap, dr_in, dr_out, len, 1);
 }
 
@@ -170,7 +172,9 @@ int avr_jtag_senddat_u8(struct jtag_tap *tap, uint8_t* dr_in, uint8_t dr_out,
 /* write an instruction to IR */
 int avr_jtag_sendinstr(struct jtag_tap *tap, uint8_t *ir_in, uint8_t ir_out)
 {
+#ifdef DEBUG_AVR_VERBOSE
 	LOG_DEBUG("avr send instruction %X", (ir_out & ((1<<AVR_JTAG_INS_LEN) - 1)));
+#endif
 	return mcu_write_ir_u8(tap, ir_in, ir_out, AVR_JTAG_INS_LEN, 1);
 }
 

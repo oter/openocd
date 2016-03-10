@@ -23,6 +23,8 @@
 
 #include <jtag/jtag.h>
 
+//#define DEBUG_AVR_VERBOSE
+
 struct mcu_jtag {
 	struct jtag_tap *tap;
 };

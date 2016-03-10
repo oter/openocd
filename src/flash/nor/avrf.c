@@ -25,6 +25,8 @@
 #include "imp.h"
 #include <target/avrt.h>
 
+#define AVR_VERIFY_AFTER_FLASH_WRITE
+
 /* AVR_JTAG_Instructions */
 #define AVR_JTAG_INS_LEN                                        4
 /* Public Instructions: */
@@ -204,6 +206,7 @@ static int avr_jtagprg_writeflashpage(struct avr_common *avr,
 	return ERROR_OK;
 }
 
+#ifdef AVR_VERIFY_AFTER_FLASH_WRITE
 static int avr_jtagprg_readflashpage(struct avr_common *avr,
 	uint8_t *page_buf,
 	uint32_t buf_size,
@@ -288,6 +291,7 @@ static int avr_jtagprg_readflashpage(struct avr_common *avr,
 
 	return ERROR_OK;
 }
+#endif /* AVR_VERIFY_AFTER_FLASH_WRITE */
 
 FLASH_BANK_COMMAND_HANDLER(avrf_flash_bank_command)
 {
@@ -377,6 +381,7 @@ static int avrf_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t o
 		keep_alive();
 	}
 
+#ifdef AVR_VERIFY_AFTER_FLASH_WRITE
 	uint8_t page_buf[page_size];
 	for (cur_size = 0; cur_size < count; cur_size += page_size) {
 		bytes_remaining = count - cur_size;
@@ -386,16 +391,23 @@ static int avrf_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t o
 			cur_buffer_size,
 			offset + cur_size,
 			page_size);
+#ifdef DEBUG_AVR_VERBOSE
 		LOG_DEBUG("Bytes at 0x%08" PRIx32 ":", offset + cur_size);
+#endif
 		for (uint32_t pos = 0; pos < page_size && pos < cur_buffer_size; ++pos) {
+#ifdef DEBUG_AVR_VERBOSE
 			printf("%02X ", page_buf[pos]);
+#endif
 			if (page_buf[pos] != buffer[cur_size + pos]) {
 				LOG_DEBUG("readback mismatch at 0x%08" PRIx32 ": expected %02X, got %02X",
 					offset + cur_size + pos, buffer[cur_size + pos], page_buf[pos]);
 			}
 		}
+#ifdef DEBUG_AVR_VERBOSE
 		printf("\n");
+#endif
 	}
+#endif /* AVR_VERIFY_AFTER_FLASH_WRITE */
 
 	return avr_jtagprg_leaveprogmode(avr);
 }
