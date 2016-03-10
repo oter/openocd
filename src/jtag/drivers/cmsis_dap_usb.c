@@ -171,8 +171,31 @@ struct pending_transfer_result {
 	void *buffer;
 };
 
+struct pending_scan_result {
+	/** Offset in bytes in the CMD_DAP_JTAG_SEQ response buffer. */
+	unsigned first;
+	/** Number of bits to read. */
+	unsigned length;
+	/** Location to store the result */
+	uint8_t *buffer;
+	/** Offset in the destination buffer */
+	unsigned buffer_offset;
+};
+
 static int pending_transfer_count, pending_queue_len;
 static struct pending_transfer_result *pending_transfers;
+
+/* pointers to buffers that will receive jtag scan results on the next flush */
+#define MAX_PENDING_SCAN_RESULTS 256
+static int pending_scan_result_count = 0;
+static struct pending_scan_result pending_scan_results[MAX_PENDING_SCAN_RESULTS];
+
+/* queued JTAG sequences that will be executed on the next flush */
+#define QUEUED_SEQ_BUF_LEN (cmsis_dap_handle->packet_size - 3)
+static int queued_seq_count = 0;
+static int queued_seq_buf_end = 0;
+static int queued_seq_tdo_ptr = 0;
+static uint8_t queued_seq_buf[1024]; //TODO: make dynamic / move into cmsis object
 
 static int queued_retval;
 
@@ -1004,7 +1027,7 @@ static void cmsis_dap_end_state(tap_state_t state)
 	}
 }
 
-#ifdef CMSIS_DAP_JTAG_DEBUG
+#ifdef SPRINT_BINARY
 static void sprint_binary(char* s, const uint8_t* buf, int offset, int len) {
 	if (!len) return;
 
@@ -1073,233 +1096,277 @@ static void debug_parse_cmsis_buf(const uint8_t* cmd, int cmdlen) {
 }
 #endif
 
-
-/* Move to the end state by clocking bits into TMS as appropriate using
- * the CMSIS-DAP DAP_SWJ_Sequence command.
- */
-static void cmsis_dap_state_move()
+static void cmsis_dap_flush()
 {
-	// LOG_DEBUG("cmsis_dap_state_move from %s to %s", tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()));
+	if (!queued_seq_count) return;
 
-	/* tap_get_tms_path() can only handle moving between stable states, so if we're in an unstable state,
-	 * move to a stable state first.
-	 */
-	bool exit_to_pause = false;
-	switch (tap_get_state()) {
-	case TAP_DREXIT1:
-		// LOG_DEBUG("moving out of DREXIT1");
-		exit_to_pause = true;
-		tap_set_state(TAP_DRPAUSE);
-		break;
-	case TAP_IREXIT1:
-		// LOG_DEBUG("moving out of IREXIT1");
-		exit_to_pause = true;
-		tap_set_state(TAP_IRPAUSE);
-		break;
-	default:
-		break;
+	DEBUG_JTAG_IO("Flushing %d queued sequences (%d bytes) with %d pending scan results to capture",
+		queued_seq_count, queued_seq_buf_end, pending_scan_result_count);
+
+	/* prep CMSIS-DAP packet */
+	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
+	buffer[0] = 0;	/* report number */
+	buffer[1] = CMD_DAP_JTAG_SEQ;
+	buffer[2] = queued_seq_count;
+	memcpy(buffer + 3, queued_seq_buf, queued_seq_buf_end);
+
+#ifdef CMSIS_DAP_JTAG_DEBUG
+	debug_parse_cmsis_buf(buffer, queued_seq_buf_end + 3);
+#endif
+
+	/* send command to USB device */
+	int retval = cmsis_dap_usb_xfer(cmsis_dap_handle, queued_seq_buf_end + 3);
+	if (retval != ERROR_OK || buffer[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP command CMD_DAP_JTAG_SEQ failed.");
+		exit(-1);
 	}
 
-	uint8_t tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
-	int tms_count = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
 #ifdef CMSIS_DAP_JTAG_DEBUG
-	LOG_DEBUG("STATE MOVE %02X (%d clocks) to get from %s to %s",
-		tms_scan, tms_count,
-		tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()));
+	DEBUG_JTAG_IO("USB response buf:");
+	for (int c = 0; c < queued_seq_buf_end + 3; ++c) {
+		printf("%02X ", buffer[c]);
+	}
+	printf("\n");
 #endif
 
-	if (exit_to_pause) {
-		/* need to shift in an extra 0 before the usual sequence */
-		uint8_t scan[2];
-		scan[0] = (uint8_t)(tms_scan << 1);
-		scan[1] = (uint8_t)(tms_scan >> 7);
+	/* copy scan results into client buffers */
+	for (int i = 0; i < pending_scan_result_count; ++i) {
+		struct pending_scan_result *scan = &pending_scan_results[i];
+		DEBUG_JTAG_IO("Copying pending_scan_result %d/%d: %d bits from byte %d -> buffer + %d bits",
+			i, pending_scan_result_count, scan->length, scan->first + 2, scan->buffer_offset);
 #ifdef CMSIS_DAP_JTAG_DEBUG
-		LOG_DEBUG("add in an extra 1 to get out of ?REXIT: now %02X (%d clocks)", scan[0], tms_count + 1);
+		for (uint32_t b = 0; b < DIV_ROUND_UP(scan->length, 8); ++b) {
+			printf("%02X ", buffer[2+scan->first+b]);
+		}
+		printf("\n");
 #endif
-		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count + 1, scan);
+		bit_copy(scan->buffer, scan->buffer_offset, buffer + 2 + scan->first, 0, scan->length);
+	}
+
+	/* reset */
+	queued_seq_count = 0;
+	queued_seq_buf_end = 0;
+	queued_seq_tdo_ptr = 0;
+	pending_scan_result_count = 0;
+}
+
+/* queue a sequence of bits to clock out TDI / in TDO, executing if the buffer is full.
+ *
+ * sequence=NULL means clock out zeros on TDI
+ * tdo_buffer=NULL means don't capture TDO
+ */
+static void cmsis_dap_add_jtag_sequence(
+	int s_len,
+	const uint8_t* sequence, int s_offset,
+	bool tms,
+	uint8_t* tdo_buffer, int tdo_buffer_offset)
+{
+	DEBUG_JTAG_IO("[at %d] %d bits, tms %s, seq offset %d, tdo buf %p, tdo offset %d",
+		queued_seq_buf_end,
+		s_len, tms ? "HIGH" : "LOW", s_offset, tdo_buffer, tdo_buffer_offset);
+
+	if (s_len == 0) {
+		return;
+	}
+	if (s_len > 64) {
+		DEBUG_JTAG_IO("START JTAG SEQ SPLIT");
+		for (int offset = 0; offset < s_len; offset += 64) {
+			int len = s_len - offset;
+			if (len > 64) len = 64;
+			DEBUG_JTAG_IO("Splitting long jtag sequence: %d-bit chunk starting at offset %d", len, offset);
+			cmsis_dap_add_jtag_sequence(
+				len,
+				sequence,
+				s_offset + offset,
+				tms,
+				tdo_buffer,
+				tdo_buffer == NULL ? 0 : (tdo_buffer_offset + offset)
+				);
+		}
+		DEBUG_JTAG_IO("END JTAG SEQ SPLIT");
+		return;
+	}
+
+	int cmd_len = 1 + DIV_ROUND_UP(s_len, 8);
+	if (queued_seq_count >= 255 || queued_seq_buf_end + cmd_len > QUEUED_SEQ_BUF_LEN) {
+		/* empty out the buffer */
+		cmsis_dap_flush();
+	}
+
+	++queued_seq_count;
+
+	/* control byte */
+	queued_seq_buf[queued_seq_buf_end] =
+		(tms ? DAP_JTAG_SEQ_TMS : 0) |
+		(tdo_buffer != NULL ? DAP_JTAG_SEQ_TDO : 0) |
+		(s_len == 64 ? 0 : s_len);
+
+	if (sequence != NULL) {
+		bit_copy(&queued_seq_buf[queued_seq_buf_end + 1], 0, sequence, s_offset, s_len);
 	} else {
-		cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count, &tms_scan);
+		memset(&queued_seq_buf[queued_seq_buf_end + 1], 0, DIV_ROUND_UP(s_len, 8));
 	}
+
+	queued_seq_buf_end += cmd_len;
+
+	if (tdo_buffer != NULL) {
+		struct pending_scan_result *scan = &pending_scan_results[pending_scan_result_count++];
+		scan->first = queued_seq_tdo_ptr;
+		queued_seq_tdo_ptr += DIV_ROUND_UP(s_len, 8);
+		scan->length = s_len;
+		scan->buffer = tdo_buffer;
+		scan->buffer_offset = tdo_buffer_offset;
+	}
+}
+
+/* queue a sequence of bits to clock out TMS, executing if the buffer is full */
+static void cmsis_dap_add_tms_sequence(const uint8_t* sequence, int s_len)
+{
+	DEBUG_JTAG_IO("%d bits: %02X", s_len, *sequence);
+	/* we use a series of CMD_DAP_JTAG_SEQ commands to toggle TMS,
+	   because even though it seems ridiculously inefficient, it
+	   allows us to combine TMS and scan sequences into the same
+	   USB packet. */
+	//TODO: combine runs of the same tms value
+	for (int i = 0; i < s_len; ++i) {
+		bool bit = (sequence[i / 8] & (1 << (i % 8))) != 0;
+		cmsis_dap_add_jtag_sequence(1, NULL, 0, bit, NULL, 0);
+	}
+}
+
+/* Move to the end state by queuing a sequence to clock into TMS */
+static void cmsis_dap_state_move(void)
+{
+	uint8_t tms_scan;
+	uint8_t tms_scan_bits;
+
+	tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
+	tms_scan_bits = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
+
+	DEBUG_JTAG_IO("state move from %s to %s: %d clocks, %02X on tms",
+		tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()),
+		tms_scan_bits, tms_scan);
+	cmsis_dap_add_tms_sequence(&tms_scan, tms_scan_bits);
 
 	tap_set_state(tap_get_end_state());
 }
 
-/* Execute a scan: move to the TAP_IRSHIFT or TAP_DRSHIFT state, clock in/out some data, then move to the end state */
-static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, int scan_size)
+
+/* Execute a JTAG scan operation by queueing TMS and TDI/TDO sequences */
+static void cmsis_dap_execute_scan(struct jtag_command *cmd)
 {
-	tap_state_t saved_end_state = tap_get_end_state();
+	DEBUG_JTAG_IO("%s type:%d", cmd->cmd.scan->ir_scan ? "IRSCAN" : "DRSCAN",
+		jtag_scan_type(cmd->cmd.scan));
 
-	if (!((!ir_scan &&
-			(tap_get_state() == TAP_DRSHIFT)) ||
-			(ir_scan && (tap_get_state() == TAP_IRSHIFT)))) {
-		if (ir_scan)
+	/* Make sure there are no trailing fields with num_bits == 0, or the logic below will fail. */
+	while (cmd->cmd.scan->num_fields > 0
+			&& cmd->cmd.scan->fields[cmd->cmd.scan->num_fields - 1].num_bits == 0) {
+		cmd->cmd.scan->num_fields--;
+		LOG_DEBUG("discarding trailing empty field");
+	}
+
+	if (cmd->cmd.scan->num_fields == 0) {
+		LOG_DEBUG("empty scan, doing nothing");
+		return;
+	}
+
+	if (cmd->cmd.scan->ir_scan) {
+		if (tap_get_state() != TAP_IRSHIFT) {
 			cmsis_dap_end_state(TAP_IRSHIFT);
-		else
+			cmsis_dap_state_move();
+		}
+	} else {
+		if (tap_get_state() != TAP_DRSHIFT) {
 			cmsis_dap_end_state(TAP_DRSHIFT);
-
-		cmsis_dap_state_move();
-		cmsis_dap_end_state(saved_end_state);
+			cmsis_dap_state_move();
+		}
 	}
 
-#ifdef CMSIS_DAP_JTAG_DEBUG
-	char debug[2000];
-	sprintf(debug, "%cR in ", ir_scan ? 'I' : 'D');
-	sprint_binary(debug + strlen(debug), sequence, 0, scan_size);
-#endif
+	cmsis_dap_end_state(cmd->cmd.scan->end_state);
 
-	/* Split scan up into 64-bit chunks and issue a new USB request for each one.  This is suboptimal,
-	 * but if we only use it for the inital scan chain enumeration, it doesn't matter.  If it turns out
-	 * that drivers habitually make long scan requests, modify this to pack as much as possible into
-	 * each USB request.
-	 */
-	for (int scan_start = 0; scan_start < scan_size; scan_start += 64) {
+	struct scan_field *field = cmd->cmd.scan->fields;
+	unsigned scan_size = 0;
 
-		/* If this is the last chunk, we need to set TMS when sending the final bit */
-		bool last_chunk = (scan_start + 64) >= scan_size;
-		/* Number of bits to send/receive in this chunk */
-		int chunk_bits = last_chunk ? (scan_size - scan_start) : 64;
-#ifdef CMSIS_DAP_JTAG_DEBUG
-		// LOG_INFO("cmsis-dap jtag chunk: scan_start %d scan_size %d chunk_bits %d last_chunk %d", scan_start, scan_size, chunk_bits, last_chunk ? 1 : 0);
-#endif
+	for (int i = 0; i < cmd->cmd.scan->num_fields; i++, field++) {
+		scan_size += field->num_bits;
+		DEBUG_JTAG_IO("%s%s field %d/%d %d bits",
+			field->in_value ? "in" : "",
+			field->out_value ? "out" : "",
+			i,
+			cmd->cmd.scan->num_fields,
+			field->num_bits);
 
-		/* Prepare CMSIS-DAP JTAG Sequence command:
-		 *
-		 * #0 = 0 (report number)
-		 * #1 = CMD_DAP_JTAG_SEQ
-		 * #2 = number of sequences
-		 * #3 = sequence info 1
-		 * #4...4+n_bytes-1 = sequence 1
-		 * #4+n_bytes = sequence info 2
-		 * #5+n_bytes = sequence 2 (single bit)
-		 *
-		 * so a 32-bit sequence will go in #4-7, leaving #8 and #9 for sequence 2
-		 */
-		uint8_t *buffer = cmsis_dap_handle->packet_buffer;
-		buffer[0] = 0;	/* report number */
-		buffer[1] = CMD_DAP_JTAG_SEQ;
-		buffer[2] = 1; /* default 1 sequence */
-		uint8_t buf_ptr = 3; /* data blocks start at buffer[3] */
-		uint8_t first_seq_start = 4; /* start of first buffer */
-		uint8_t second_seq_start = 0; /* start of second data buffer if we use one */
+		if (i == cmd->cmd.scan->num_fields - 1 && tap_get_state() != tap_get_end_state()) {
+			DEBUG_JTAG_IO("Last field and have to move out of SHIFT state");
+			/* Last field, and we're leaving IRSHIFT/DRSHIFT. Clock last bit during tap
+			 * movement. This last field can't have length zero, it was checked above. */
+			cmsis_dap_add_jtag_sequence(
+				field->num_bits - 1, /* number of bits to clock */
+				field->out_value, /* output sequence */
+				0, /* output offset */
+				false, /* TMS low */
+				field->in_value,
+				0);
 
-		if (chunk_bits == 0) {
-			LOG_ERROR("BUG: Empty scan chunk");
-			exit(-1);
-		} else if (chunk_bits > 64) {
-			LOG_ERROR("BUG: Scan chunk > 64 bits");
-			exit(-1);
-		} else if (!last_chunk) {
-			/* We're only sending part of the scan request, so don't raise TMS on the final bit */
-			/* 64 bits with TMS=0 */
-			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO;
-			/* copying 64 bits from sequence, starting at scan_start, into buffer[3...] */
-			bit_copy(&buffer[buf_ptr], 0, sequence, scan_start, 64);
-			buf_ptr += 8;
-		} else if (chunk_bits == 1) {
-			/* Just clock out one bit with TMS=1 */
-			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
-			bit_copy(&buffer[buf_ptr++], 0, sequence, scan_start, 1);
+			/* Clock the last bit out, with TMS high */
+			uint8_t last_bit = 0;
+			if (field->out_value)
+				bit_copy(&last_bit, 0, field->out_value, field->num_bits - 1, 1);
+			cmsis_dap_add_jtag_sequence(
+				1,
+				&last_bit,
+				0,
+				true,
+				field->in_value,
+				field->num_bits - 1);
+			tap_set_state(tap_state_transition(tap_get_state(), 1));
+
+			/* Now clock one more cycle, with TMS low, to get us into a PAUSE state */
+			cmsis_dap_add_jtag_sequence(
+				1,
+				&last_bit,
+				0,
+				false,
+				NULL,
+				0);
+			tap_set_state(tap_state_transition(tap_get_state(), 0));
 		} else {
-			/* Split our scan into two sequences, one with TMS=0 and (scan_size-1) bits, and one with TMS=0 and 1 bit. */
-			buffer[2] = 2;
-
-			/* Sequence 1 */
-			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | (chunk_bits - 1);
-			bit_copy(&buffer[buf_ptr], 0, sequence, scan_start, chunk_bits - 1);
-
-			/* Figure out how many bytes we just used in the buffer */
-			buf_ptr += DIV_ROUND_UP((chunk_bits - 1), 8);
-
-			/* Sequence 2: the final bit */
-			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
-			second_seq_start = buf_ptr;
-			bit_copy(&buffer[buf_ptr++], 0, sequence, scan_start + chunk_bits - 1, 1);
-		}
-
-#ifdef CMSIS_DAP_JTAG_DEBUG
-		debug_parse_cmsis_buf(buffer, buf_ptr);
-#endif
-
-		/* Send command */
-		int retval = cmsis_dap_usb_xfer(cmsis_dap_handle, buf_ptr);
-
-		if (retval != ERROR_OK || buffer[1] != DAP_OK) {
-			LOG_ERROR("CMSIS-DAP command CMD_DAP_JTAG_SEQ failed.");
-			return ERROR_JTAG_DEVICE_ERROR;
-		}
-
-#ifdef CMSIS_DAP_JTAG_DEBUG
-		printf("cmsis-dap buffer at end: ");
-		for (int i = 0; i < buf_ptr; ++i) { printf(" %02x", buffer[i]); }
-		printf("\n");
-#endif
-
-		/* Copy results into the sequence buffer if we want them */
-		if (type == SCAN_IN || type == SCAN_IO) {
-			if (!last_chunk) {
-				/* 64 bit chunk, single sequence */
-				bit_copy(sequence, scan_start, &buffer[first_seq_start-2], 0, 64);
-			} else if (chunk_bits == 1) {
-				/* 1 bit chunk, single sequence */
-				bit_copy(sequence, scan_start, &buffer[first_seq_start-2], 0, 1);
-			} else {
-				/* last chunk, two sequences */
-				bit_copy(sequence, scan_start, &buffer[first_seq_start-2], 0, chunk_bits - 1);
-				bit_copy(sequence, scan_start + chunk_bits - 1, &buffer[second_seq_start-3], 0, 1);
-			}
+			DEBUG_JTAG_IO("Internal field, staying in SHIFT state afterwards");
+			/* Clocking part of a sequence into DR or IR with TMS=0,
+			   leaving TMS=0 at the end so we can continue later */
+			cmsis_dap_add_jtag_sequence(
+				field->num_bits,
+				field->out_value,
+				0,
+				false,
+				field->in_value,
+				0);
 		}
 	}
-
-#ifdef CMSIS_DAP_JTAG_DEBUG
-	if (type == SCAN_IN || type == SCAN_IO) {
-		strcat(debug, " out ");
-		sprint_binary(debug + strlen(debug), sequence, 0, scan_size);
-	}
-	LOG_DEBUG("%s", debug);
-#endif
-
-	/* The final bit will have transitioned us to Exit1-DR or Exit1-IR */
-	tap_set_state(tap_get_state() == TAP_DRSHIFT ? TAP_DREXIT1 : TAP_IREXIT1);
 
 	if (tap_get_state() != tap_get_end_state()) {
+		cmsis_dap_end_state(tap_get_end_state());
 		cmsis_dap_state_move();
 	}
 
-	return ERROR_OK;
-}
-
-static int cmsis_dap_execute_scan(struct jtag_command *cmd)
-{
-#ifdef _DEBUG_JTAG_IO_
-	LOG_DEBUG("%s scan end in %s",
-			(cmd->cmd.scan->ir_scan) ? "IR" : "DR",
-		tap_state_name(cmd->cmd.scan->end_state));
-#endif
-	cmsis_dap_end_state(cmd->cmd.scan->end_state);
-	uint8_t *buffer;
-	int scan_size = jtag_build_buffer(cmd->cmd.scan, &buffer);
-	// printf("scan size %d, bytes", scan_size);
-	// for (int i = 0; i < DIV_ROUND_UP(scan_size, 8); ++i) printf(" %02x", buffer[i]);
-	// printf("\n");
-	int type = jtag_scan_type(cmd->cmd.scan);
-	int retval = cmsis_dap_scan(cmd->cmd.scan->ir_scan, type, buffer, scan_size);
-	if (jtag_read_buffer(buffer, cmd->cmd.scan) != ERROR_OK)
-		retval = ERROR_JTAG_QUEUE_FAILED;
-	if (buffer)
-		free(buffer);
-	return retval;
+	DEBUG_JTAG_IO("%s scan, %i bits, end in %s",
+		(cmd->cmd.scan->ir_scan) ? "IR" : "DR", scan_size,
+		tap_state_name(tap_get_end_state()));
 }
 
 static void cmsis_dap_execute_command(struct jtag_command *cmd)
 {
 	switch (cmd->type) {
 		case JTAG_RESET:
+			cmsis_dap_flush();
 			cmsis_dap_execute_reset(cmd);
 			break;
 		case JTAG_SLEEP:
+			cmsis_dap_flush();
 			cmsis_dap_execute_sleep(cmd);
 			break;
 		case JTAG_TLR_RESET:
+			cmsis_dap_flush();
 			cmsis_dap_execute_tlr_reset(cmd);
 			break;
 		case JTAG_SCAN:
@@ -1323,6 +1390,8 @@ static int cmsis_dap_execute_queue(void)
 		cmsis_dap_execute_command(cmd);
 		cmd = cmd->next;
 	}
+
+	cmsis_dap_flush();
 
 	return ERROR_OK;
 }
