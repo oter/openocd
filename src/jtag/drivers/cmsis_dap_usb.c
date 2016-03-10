@@ -986,8 +986,8 @@ static void cmsis_dap_execute_sleep(struct jtag_command *cmd)
 static int cmsis_dap_execute_tlr_reset(struct jtag_command *cmd)
 {
 	LOG_INFO("cmsis-dap JTAG TLR_RESET");
-	uint8_t seq = 0x1f;
-	int ret = cmsis_dap_cmd_DAP_SWJ_Sequence(5, &seq);
+	uint8_t seq = 0xff;
+	int ret = cmsis_dap_cmd_DAP_SWJ_Sequence(8, &seq);
 	if (ret == ERROR_OK)
 		tap_set_state(TAP_RESET);
 	return ret;
