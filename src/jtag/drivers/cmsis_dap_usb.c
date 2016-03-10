@@ -178,6 +178,40 @@ static int queued_retval;
 
 static struct cmsis_dap *cmsis_dap_handle;
 
+/* Wake up the CMSIS-DAP device by sending a bunch of CMD_INFO requests */
+static int cmsis_dap_usb_wakeup(struct cmsis_dap *dap)
+{
+	memset(dap->packet_buffer, 0, dap->packet_size);
+	dap->packet_buffer[0] = 0;	/* report number */
+	dap->packet_buffer[1] = CMD_DAP_INFO;
+	dap->packet_buffer[2] = INFO_ID_CAPS;
+
+	for (int retry = 0; retry < 3; ++retry) {
+		/* write data to device */
+		LOG_DEBUG("send CMD_INFO, try %d", retry);
+		int retval = hid_write(dap->dev_handle, dap->packet_buffer, dap->packet_size);
+		if (retval == -1) {
+			LOG_ERROR("error writing data: %ls", hid_error(dap->dev_handle));
+			return ERROR_FAIL;
+		}
+		LOG_ERROR("hid_write returned %d", retval);
+
+		/* see if we get a reply within 100 ms */
+		LOG_DEBUG("check for response for 100 ms");
+		retval = hid_read_timeout(dap->dev_handle, dap->packet_buffer, dap->packet_size, 100);
+		if (retval == -1 || retval == 0) {
+			LOG_DEBUG("error reading data: %ls", hid_error(dap->dev_handle));
+			continue;
+		}
+
+		/* success! */
+		LOG_DEBUG("CMSIS-DAP USB should be awake now");
+		return ERROR_OK;
+	}
+
+	return ERROR_FAIL;
+}
+
 static int cmsis_dap_usb_open(void)
 {
 	hid_device *dev = NULL;
@@ -299,7 +333,7 @@ static int cmsis_dap_usb_open(void)
 		return ERROR_FAIL;
 	}
 
-	return ERROR_OK;
+	return cmsis_dap_usb_wakeup(dap);
 }
 
 static void cmsis_dap_usb_close(struct cmsis_dap *dap)
