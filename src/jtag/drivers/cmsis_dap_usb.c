@@ -1,4 +1,4 @@
-//#define CMSIS_DAP_JTAG_DEBUG
+#define CMSIS_DAP_JTAG_DEBUG
 /***************************************************************************
  *   Copyright (C) 2016 by Phillip Pearson                                 *
  *   pp@myelin.co.nz                                                       *
@@ -994,26 +994,37 @@ static void cmsis_dap_end_state(tap_state_t state)
 }
 
 static void sprint_binary(char* s, const uint8_t* buf, int offset, int len) {
+	if (!len) return;
+
+	/*
+	buf = { 0x18 } len=5 should result in: 11000
+	buf = { 0xff 0x18 } len=13 should result in: 11111111 11000
+	buf = { 0xc0 0x18 } offset=3 len=10 should result in: 11000 11000
+		i=3 there means i/8 = 0 so c = 0xFF, and 
+	*/
 	for (int i = offset; i < offset + len; ++i) {
-		uint8_t c = buf[i / 8], mask = 1 << (7 - (i % 8));
+		uint8_t c = buf[i / 8], mask = 1 << (i % 8);
 		if ((i != offset) && !(i % 8)) putchar(' ');
 		*s++ = (c & mask) ? '1' : '0';
 	}
 	*s = 0;
 }
 
-#ifdef CMSIS_DAP_JTAG_DEBUG
+/*
 static void bit_copy_debug(uint8_t *dst, unsigned dst_offset, const uint8_t *src, unsigned src_offset, unsigned bit_count) {
 	printf("bit copy dst_offset=%d src_offset=%d bit_count=%d: ", dst_offset, src_offset, bit_count);
 	print_binary(src, src_offset, bit_count);
 	printf("\n");
 	bit_copy(dst, dst_offset, src, src_offset, bit_count);
 }
+*/
 
+#ifdef CMSIS_DAP_JTAG_DEBUG
 static void debug_parse_cmsis_buf(const uint8_t* cmd, int cmdlen) {
 	/* cmd is a usb packet to go to the cmsis-dap interface */
-	printf("cmsis-dap buffer (%d b): ", cmdlen); print_binary(cmd, 0, cmdlen*8); printf("\n");
-	for (int i = 0; i < cmdlen; ++i) { printf(" %02x", cmd[i]); } printf("\n");
+	printf("cmsis-dap buffer (%d b): ", cmdlen);
+	for (int i = 0; i < cmdlen; ++i) { printf(" %02x", cmd[i]); }
+	printf("\n");
 	switch (cmd[1]) {
 		case CMD_DAP_JTAG_SEQ: {
 			printf("cmsis-dap jtag sequence command %02x (n=%d)\n", cmd[1], cmd[2]);
@@ -1031,8 +1042,8 @@ static void debug_parse_cmsis_buf(const uint8_t* cmd, int cmdlen) {
 				if (len == 0) len = 64;
 				printf("  sequence %d starting %d: info %02x (len=%d tms=%d read_tdo=%d): ",
 					seq, pos, info, len, info & DAP_JTAG_SEQ_TMS, info & DAP_JTAG_SEQ_TDO);
-				print_binary(cmd+pos, 0, len);
-				pos += (len + 7) / 8;
+				for (int i = 0; i < DIV_ROUND_UP(len, 8); ++i) { printf(" %02x", cmd[pos+i]); }
+				pos += DIV_ROUND_UP(len, 8);
 				printf("\n");
 			}
 			if (pos != cmdlen) {
@@ -1126,7 +1137,7 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 		/* Number of bits to send/receive in this chunk */
 		int chunk_bits = last_chunk ? (scan_size - scan_start) : 64;
 #ifdef CMSIS_DAP_JTAG_DEBUG
-		LOG_INFO("cmsis-dap jtag chunk: scan_start %d scan_size %d chunk_bits %d last_chunk %d", scan_start, scan_size, chunk_bits, last_chunk ? 1 : 0);
+		// LOG_INFO("cmsis-dap jtag chunk: scan_start %d scan_size %d chunk_bits %d last_chunk %d", scan_start, scan_size, chunk_bits, last_chunk ? 1 : 0);
 #endif
 
 		/* Prepare CMSIS-DAP JTAG Sequence command:
@@ -1175,7 +1186,7 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 			bit_copy(&buffer[buf_ptr], 0, sequence, scan_start, chunk_bits - 1);
 
 			/* Figure out how many bytes we just used in the buffer */
-			buf_ptr += ((chunk_bits - 1) + 7) / 8;
+			buf_ptr += DIV_ROUND_UP((chunk_bits - 1), 8);
 
 			/* Sequence 2: the final bit */
 			buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
@@ -1196,7 +1207,9 @@ static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, 
 		}
 
 #ifdef CMSIS_DAP_JTAG_DEBUG
-		printf("cmsis-dap buffer at end: "); print_binary(buffer, 0, 8 * buf_ptr); printf("\n");
+		printf("cmsis-dap buffer at end: ");
+		for (int i = 0; i < buf_ptr; ++i) { printf(" %02x", buffer[i]); }
+		printf("\n");
 #endif
 
 		/* Copy results into the sequence buffer if we want them */
@@ -1241,6 +1254,9 @@ static int cmsis_dap_execute_scan(struct jtag_command *cmd)
 	cmsis_dap_end_state(cmd->cmd.scan->end_state);
 	uint8_t *buffer;
 	int scan_size = jtag_build_buffer(cmd->cmd.scan, &buffer);
+	// printf("scan size %d, bytes", scan_size);
+	// for (int i = 0; i < DIV_ROUND_UP(scan_size, 8); ++i) printf(" %02x", buffer[i]);
+	// printf("\n");
 	int type = jtag_scan_type(cmd->cmd.scan);
 	int retval = cmsis_dap_scan(cmd->cmd.scan->ir_scan, type, buffer, scan_size);
 	if (jtag_read_buffer(buffer, cmd->cmd.scan) != ERROR_OK)

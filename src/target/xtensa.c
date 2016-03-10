@@ -289,6 +289,9 @@ static int xtensa_tap_queue(struct target *target,
 		NULL, TAP_IDLE);
 	jtag_add_plain_dr_scan(ins->data_len, data_out, data_in, TAP_IDLE);
 
+	// LOG_DEBUG("queued tap instruction %d (%s, 0x%02x == 0x%02x) with data len %d",
+	// 	inst_idx, ins->name, ins->inst, *(tap_instr_buf+inst_idx*4), ins->data_len);
+
 	return ERROR_OK;
 }
 
