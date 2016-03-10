@@ -569,6 +569,45 @@ COMMAND_HANDLER(avrf_handle_mass_erase_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(avrf_handle_read_fuses_command)
+{
+	if (CMD_ARGC > 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	struct target *target = get_current_target(CMD_CTX);
+	struct avr_common *avr = target->arch_info;
+
+	int status = avr_jtagprg_enterprogmode(avr);
+	if (status != ERROR_OK)
+		return status;
+
+	uint32_t hfuse = 0, efuse = 0, lfuse = 0, lock = 0;
+
+	avr_jtag_sendinstr(avr->jtag_info.tap, NULL, AVR_JTAG_INS_PROG_COMMANDS);
+	/* enter fuse/lock bit read */
+	avr_jtag_senddat(avr->jtag_info.tap, NULL, 0x2304, AVR_JTAG_REG_ProgrammingCommand_Len);
+	/* read efuse */
+	avr_jtag_senddat(avr->jtag_info.tap, NULL, 0x3A00, AVR_JTAG_REG_ProgrammingCommand_Len);
+	/* read hfuse (returns result of previous command)  */
+	avr_jtag_senddat(avr->jtag_info.tap, &efuse, 0x3E00, AVR_JTAG_REG_ProgrammingCommand_Len);
+	/* read lfuse (returns result of previous command)  */
+	avr_jtag_senddat(avr->jtag_info.tap, &hfuse, 0x3200, AVR_JTAG_REG_ProgrammingCommand_Len);
+	/* read lock bits (returns result of previous command) */
+	avr_jtag_senddat(avr->jtag_info.tap, &lfuse, 0x3600, AVR_JTAG_REG_ProgrammingCommand_Len);
+	/* get result of lock bit read */
+	avr_jtag_senddat(avr->jtag_info.tap, &lock, 0x3700, AVR_JTAG_REG_ProgrammingCommand_Len);
+
+	if (ERROR_OK != mcu_execute_queue())
+		return ERROR_FAIL;
+
+	command_print(CMD_CTX, "efuse 0x%02X hfuse 0x%02X lfuse 0x%02X lock 0x%02X",
+		(uint8_t)efuse, (uint8_t)hfuse, (uint8_t)lfuse, (uint8_t)lock);
+
+	LOG_DEBUG("%s", __func__);
+
+	return avr_jtagprg_leaveprogmode(avr);
+}
+
 static const struct command_registration avrf_exec_command_handlers[] = {
 	{
 		.name = "mass_erase",
@@ -576,6 +615,13 @@ static const struct command_registration avrf_exec_command_handlers[] = {
 		.handler = avrf_handle_mass_erase_command,
 		.mode = COMMAND_EXEC,
 		.help = "erase entire device",
+	},
+	{
+		.name = "read_fuses",
+		.usage = "",
+		.handler = avrf_handle_read_fuses_command,
+		.mode = COMMAND_EXEC,
+		.help = "read AVR fuses",
 	},
 	COMMAND_REGISTRATION_DONE
 };
