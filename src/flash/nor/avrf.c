@@ -196,6 +196,91 @@ static int avr_jtagprg_writeflashpage(struct avr_common *avr,
 	return ERROR_OK;
 }
 
+static int avr_jtagprg_readflashpage(struct avr_common *avr,
+	uint8_t *page_buf,
+	uint32_t buf_size,
+	uint32_t addr,
+	uint32_t page_size)
+{
+	uint32_t i;
+
+	if (addr & 1) {
+		LOG_DEBUG("AVR flash reads must be 16-bit word aligned");
+		return ERROR_FLASH_OPERATION_FAILED;
+	}
+
+	/* enter flash read */
+	avr_jtag_sendinstr(avr->jtag_info.tap, NULL, AVR_JTAG_INS_PROG_COMMANDS);
+	avr_jtag_senddat(avr->jtag_info.tap, NULL, 0x2302, AVR_JTAG_REG_ProgrammingCommand_Len);
+
+//#define SLOW_FLASH_READ
+#ifdef SLOW_FLASH_READ
+	for (i = 0; i < page_size && i < buf_size; i += 2) {
+		uint32_t read_addr = addr + i;
+
+		/* load addr high byte */
+		avr_jtag_senddat(avr->jtag_info.tap,
+			NULL,
+			0x0700 | ((read_addr >> 9) & 0xFF),
+			AVR_JTAG_REG_ProgrammingCommand_Len);
+
+		/* load addr low byte */
+		avr_jtag_senddat(avr->jtag_info.tap,
+			NULL,
+			0x0300 | ((read_addr >> 1) & 0xFF),
+			AVR_JTAG_REG_ProgrammingCommand_Len);
+
+		/* read two bytes */
+		uint32_t low = 0, high = 0;
+		avr_jtag_senddat(avr->jtag_info.tap,
+			NULL,
+			0x3200,
+			AVR_JTAG_REG_ProgrammingCommand_Len);
+		avr_jtag_senddat(avr->jtag_info.tap,
+			&low,
+			0x3600,
+			AVR_JTAG_REG_ProgrammingCommand_Len);
+		avr_jtag_senddat(avr->jtag_info.tap,
+			&high,
+			0x3700,
+			AVR_JTAG_REG_ProgrammingCommand_Len);
+
+		if (ERROR_OK != mcu_execute_queue())
+			return ERROR_FAIL;
+
+		page_buf[i] = (uint8_t)low;
+		if (i + 1 < buf_size) {
+			page_buf[i+1] = (uint8_t)high;
+		}
+	}
+#else
+	/* load addr high byte */
+	avr_jtag_senddat(avr->jtag_info.tap,
+		NULL,
+		0x0700 | ((addr >> 9) & 0xFF),
+		AVR_JTAG_REG_ProgrammingCommand_Len);
+
+	/* load addr low byte */
+	avr_jtag_senddat(avr->jtag_info.tap,
+		NULL,
+		0x0300 | ((addr >> 1) & 0xFF),
+		AVR_JTAG_REG_ProgrammingCommand_Len);
+
+	/* switch to page read mode */
+	avr_jtag_sendinstr(avr->jtag_info.tap, NULL, AVR_JTAG_INS_PROG_PAGEREAD);
+
+	/* read out the page, one byte at a time */
+	for (i = 0; i < page_size && i < buf_size; i++) {
+		avr_jtag_senddat_u8(avr->jtag_info.tap, &page_buf[i], 0, 8);
+	}
+
+	if (ERROR_OK != mcu_execute_queue())
+		return ERROR_FAIL;
+#endif
+
+	return ERROR_OK;
+}
+
 FLASH_BANK_COMMAND_HANDLER(avrf_flash_bank_command)
 {
 	struct avrf_flash_bank *avrf_info;
@@ -245,7 +330,7 @@ static int avrf_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t o
 {
 	struct target *target = bank->target;
 	struct avr_common *avr = target->arch_info;
-	uint32_t cur_size, cur_buffer_size, page_size;
+	uint32_t cur_size, cur_buffer_size, bytes_remaining, page_size;
 
 	if (bank->target->state != TARGET_HALTED) {
 		LOG_ERROR("Target not halted");
@@ -267,20 +352,41 @@ static int avrf_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t o
 		return ERROR_FAIL;
 
 	cur_size = 0;
-	while (count > 0) {
-		if (count > page_size)
+	bytes_remaining = count;
+	while (bytes_remaining > 0) {
+		if (bytes_remaining > page_size)
 			cur_buffer_size = page_size;
 		else
-			cur_buffer_size = count;
+			cur_buffer_size = bytes_remaining;
 		avr_jtagprg_writeflashpage(avr,
 			buffer + cur_size,
 			cur_buffer_size,
 			offset + cur_size,
 			page_size);
-		count -= cur_buffer_size;
+		bytes_remaining -= cur_buffer_size;
 		cur_size += cur_buffer_size;
 
 		keep_alive();
+	}
+
+	uint8_t page_buf[page_size];
+	for (cur_size = 0; cur_size < count; cur_size += page_size) {
+		bytes_remaining = count - cur_size;
+		cur_buffer_size = (bytes_remaining > page_size) ? page_size : bytes_remaining;
+		avr_jtagprg_readflashpage(avr,
+			page_buf,
+			cur_buffer_size,
+			offset + cur_size,
+			page_size);
+		LOG_DEBUG("Bytes at 0x%08" PRIx32 ":", offset + cur_size);
+		for (uint32_t pos = 0; pos < page_size && pos < cur_buffer_size; ++pos) {
+			printf("%02X ", page_buf[pos]);
+			if (page_buf[pos] != buffer[cur_size + pos]) {
+				LOG_DEBUG("readback mismatch at 0x%08" PRIx32 ": expected %02X, got %02X",
+					offset + cur_size + pos, buffer[cur_size + pos], page_buf[pos]);
+			}
+		}
+		printf("\n");
 	}
 
 	return avr_jtagprg_leaveprogmode(avr);

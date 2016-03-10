@@ -35,5 +35,7 @@ int mcu_execute_queue(void);
 int avr_jtag_sendinstr(struct jtag_tap *tap, uint8_t *ir_in, uint8_t ir_out);
 int avr_jtag_senddat(struct jtag_tap *tap, uint32_t *dr_in, uint32_t dr_out,
 		int len);
+int avr_jtag_senddat_u8(struct jtag_tap *tap, uint8_t* dr_in, uint8_t dr_out,
+		int len);
 
 #endif /* AVRT_H */

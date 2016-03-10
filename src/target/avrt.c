@@ -147,14 +147,30 @@ static int avr_deassert_reset(struct target *target)
 	return ERROR_OK;
 }
 
+/* write up to 32 bits to DR */
 int avr_jtag_senddat(struct jtag_tap *tap, uint32_t* dr_in, uint32_t dr_out,
 		int len)
 {
+	LOG_DEBUG("avr send data %X", (dr_out & ((1<<len) - 1)));
 	return mcu_write_dr_u32(tap, dr_in, dr_out, len, 1);
 }
 
+/* write up to 8 bits to DR */
+int avr_jtag_senddat_u8(struct jtag_tap *tap, uint8_t* dr_in, uint8_t dr_out,
+		int len)
+{
+	if (len > 8) {
+		LOG_ERROR("dr_len overflow, maximum is 8");
+		return ERROR_FAIL;
+	}
+
+	return mcu_write_dr(tap, dr_in, &dr_out, len, 1);
+}
+
+/* write an instruction to IR */
 int avr_jtag_sendinstr(struct jtag_tap *tap, uint8_t *ir_in, uint8_t ir_out)
 {
+	LOG_DEBUG("avr send instruction %X", (ir_out & ((1<<AVR_JTAG_INS_LEN) - 1)));
 	return mcu_write_ir_u8(tap, ir_in, ir_out, AVR_JTAG_INS_LEN, 1);
 }
 
@@ -197,7 +213,7 @@ static int mcu_write_ir_u8(struct jtag_tap *tap, uint8_t *ir_in,
 		uint8_t ir_out, int ir_len, int rti)
 {
 	if (ir_len > 8) {
-		LOG_ERROR("ir_len overflow, maxium is 8");
+		LOG_ERROR("ir_len overflow, maximum is 8");
 		return ERROR_FAIL;
 	}
 
@@ -210,7 +226,7 @@ static int mcu_write_dr_u32(struct jtag_tap *tap, uint32_t *dr_in,
 		uint32_t dr_out, int dr_len, int rti)
 {
 	if (dr_len > 32) {
-		LOG_ERROR("dr_len overflow, maxium is 32");
+		LOG_ERROR("dr_len overflow, maximum is 32");
 		return ERROR_FAIL;
 	}
 
