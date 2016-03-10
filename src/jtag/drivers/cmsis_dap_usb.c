@@ -122,6 +122,15 @@ static bool swd_mode;
 #define CMD_DAP_JTAG_CONFIGURE    0x15
 #define CMD_DAP_JTAG_IDCODE       0x16
 
+/* CMSIS-DAP JTAG sequence info masks */
+/* Number of bits to clock through (0 means 64) */
+#define DAP_JTAG_SEQ_TCK          0x3F
+/* TMS will be set during the sequence if this bit is set */
+#define DAP_JTAG_SEQ_TMS          0x40
+/* TDO output will be captured if this bit is set */
+#define DAP_JTAG_SEQ_TDO          0x80
+
+
 /* CMSIS-DAP Transfer Commands */
 #define CMD_DAP_TFER_CONFIGURE    0x04
 #define CMD_DAP_TFER              0x05
@@ -373,6 +382,25 @@ static int cmsis_dap_cmd_DAP_SWJ_Clock(uint32_t swj_clock)
 		LOG_ERROR("CMSIS-DAP command CMD_DAP_SWJ_CLOCK failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
 	}
+
+	return ERROR_OK;
+}
+
+/* clock a sequence of bits out on TMS, to change JTAG states */
+static int cmsis_dap_cmd_DAP_SWJ_Sequence(uint8_t s_len, const uint8_t* sequence)
+{
+	int retval;
+	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
+
+	buffer[0] = 0;	/* report number */
+	buffer[1] = CMD_DAP_SWJ_SEQ;
+	buffer[2] = s_len;
+	bit_copy(&buffer[3], 0, sequence, 0, s_len);
+
+	retval = cmsis_dap_usb_xfer(cmsis_dap_handle, DIV_ROUND_UP(s_len, 8) + 3);
+
+	if (retval != ERROR_OK || buffer[1] != DAP_OK)
+		return ERROR_FAIL;
 
 	return ERROR_OK;
 }
@@ -711,7 +739,6 @@ static int cmsis_dap_get_status(void)
 
 static int cmsis_dap_swd_switch_seq(enum swd_special_seq seq)
 {
-	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
 	const uint8_t *s;
 	unsigned int s_len;
 	int retval;
@@ -747,17 +774,7 @@ static int cmsis_dap_swd_switch_seq(enum swd_special_seq seq)
 		return ERROR_FAIL;
 	}
 
-	buffer[0] = 0;	/* report number */
-	buffer[1] = CMD_DAP_SWJ_SEQ;
-	buffer[2] = s_len;
-	bit_copy(&buffer[3], 0, s, 0, s_len);
-
-	retval = cmsis_dap_usb_xfer(cmsis_dap_handle, DIV_ROUND_UP(s_len, 8) + 3);
-
-	if (retval != ERROR_OK || buffer[1] != DAP_OK)
-		return ERROR_FAIL;
-
-	return ERROR_OK;
+	return cmsis_dap_cmd_DAP_SWJ_Sequence(s_len, s);
 }
 
 static int cmsis_dap_swd_open(void)
@@ -950,6 +967,151 @@ static void cmsis_dap_execute_sleep(struct jtag_command *cmd)
 		jtag_sleep(cmd->cmd.sleep->us);
 }
 
+/* Set TMS high for five TCK clocks, to move the TAP to the Test-Logic-Reset state */
+static int cmsis_dap_execute_tlr_reset(struct jtag_command *cmd)
+{
+	LOG_INFO("cmsis-dap JTAG TLR_RESET");
+	uint8_t seq = 0x1f;
+	int ret = cmsis_dap_cmd_DAP_SWJ_Sequence(5, &seq);
+	if (ret == ERROR_OK)
+		tap_set_state(TAP_RESET);
+	return ret;
+}
+
+/* Set new end state */
+static void cmsis_dap_end_state(tap_state_t state)
+{
+	if (tap_is_state_stable(state))
+		tap_set_end_state(state);
+	else {
+		LOG_ERROR("BUG: %i is not a valid end state", state);
+		exit(-1);
+	}
+}
+
+/* Move to the end state by clocking bits into TMS as appropriate using
+ * the CMSIS-DAP DAP_SWJ_Sequence command.
+ */
+static void cmsis_dap_state_move()
+{
+	uint8_t tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
+	int tms_count = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
+
+	cmsis_dap_cmd_DAP_SWJ_Sequence(tms_count, &tms_scan);
+
+	tap_set_state(tap_get_end_state());
+}
+
+/* Execute a scan: move to the TAP_IRSHIFT or TAP_DRSHIFT state, clock in/out some data, then move to the end state */
+static int cmsis_dap_scan(bool ir_scan, enum scan_type type, uint8_t *sequence, int scan_size)
+{
+	tap_state_t saved_end_state = tap_get_end_state();
+
+	if (!((!ir_scan &&
+			(tap_get_state() == TAP_DRSHIFT)) ||
+			(ir_scan && (tap_get_state() == TAP_IRSHIFT)))) {
+		if (ir_scan)
+			cmsis_dap_end_state(TAP_IRSHIFT);
+		else
+			cmsis_dap_end_state(TAP_DRSHIFT);
+
+		cmsis_dap_state_move();
+		cmsis_dap_end_state(saved_end_state);
+	}
+
+	if (scan_size > 64) {
+		LOG_ERROR("Splitting > 64 bit scans into multiple sequences for CMSIS-DAP is not implemented");
+		exit(-1);
+	}
+
+	/* Prepare CMSIS-DAP JTAG Sequence command:
+	 *
+	 * #0 = 0 (report number)
+	 * #1 = CMD_DAP_JTAG_SEQ
+	 * #2 = number of sequences
+	 * #3 = sequence info 1
+	 * #4...4+n_bytes-1 = sequence 1
+	 * #4+n_bytes = sequence info 2
+	 * #5+n_bytes = sequence 2 (single bit)
+	 *
+	 * so a 32-bit sequence will go in #4-7, leaving #8 and #9 for sequence 2
+	 */
+	uint8_t *buffer = cmsis_dap_handle->packet_buffer;
+	uint8_t buf_ptr = 0;
+	buffer[buf_ptr++] = 0;	/* report number */
+	buffer[buf_ptr++] = CMD_DAP_JTAG_SEQ;
+
+	if (scan_size == 0) {
+		LOG_ERROR("Empty scan");
+		exit(-1);
+	} else if (scan_size == 1) {
+		/* Just one sequence */
+		buffer[buf_ptr++] = 1;
+		/* Just clock out one bit with TMS=1 */
+		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
+		bit_copy(&buffer[buf_ptr++], 0, buffer, 0, 1);
+	} else {
+		/* Split our scan into two sequences, one with TMS=0 and (scan_size-1) bits, and one with TMS=0 and 1 bit. */
+		buffer[buf_ptr++] = 2;
+
+		/* Sequence 1 */
+		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | (scan_size - 1);
+		bit_copy(&buffer[buf_ptr], 0, buffer, 0, scan_size - 1);
+
+		/* Figure out how many bytes we just used in the buffer */
+		buf_ptr += ((scan_size - 1) + 7) / 8;
+
+		/* Sequence 2: the final bit */
+		buffer[buf_ptr++] = DAP_JTAG_SEQ_TDO | DAP_JTAG_SEQ_TMS | 1;
+		bit_copy(&buffer[buf_ptr++], 0, sequence, scan_size - 1, 1);
+	}
+
+	/* Send command */
+	int retval = cmsis_dap_usb_xfer(cmsis_dap_handle, buf_ptr);
+
+	if (retval != ERROR_OK || buffer[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP command CMD_DAP_JTAG_SEQ failed.");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	/* Copy results into the sequence buffer if we want them */
+	if (type == SCAN_IN || type == SCAN_IO) {
+		bit_copy(sequence, 0, &buffer[4], 0, (scan_size == 1) ? 1 : (scan_size - 1));
+		if (scan_size > 1) {
+			bit_copy(sequence, scan_size - 1, &buffer[5 + (scan_size - 1 + 7) / 8], 0, 1);
+		}
+	}
+
+	/* The final bit will have transitioned us to Exit1-DR or Exit1-IR */
+	tap_set_state(tap_get_state() == TAP_DRSHIFT ? TAP_DREXIT1 : TAP_IREXIT1);
+
+	if (tap_get_state() != tap_get_end_state()) {
+		cmsis_dap_state_move();
+	}
+
+	return ERROR_OK;
+}
+
+static int cmsis_dap_execute_scan(struct jtag_command *cmd)
+{
+	LOG_INFO("cmsis-dap JTAG SCAN");
+#ifdef _DEBUG_JTAG_IO_
+	LOG_DEBUG("%s scan end in %s",
+			(cmd->cmd.scan->ir_scan) ? "IR" : "DR",
+		tap_state_name(cmd->cmd.scan->end_state));
+#endif
+	cmsis_dap_end_state(cmd->cmd.scan->end_state);
+	uint8_t *buffer;
+	int scan_size = jtag_build_buffer(cmd->cmd.scan, &buffer);
+	int type = jtag_scan_type(cmd->cmd.scan);
+	int retval = cmsis_dap_scan(cmd->cmd.scan->ir_scan, type, buffer, scan_size);
+	if (jtag_read_buffer(buffer, cmd->cmd.scan) != ERROR_OK)
+		retval = ERROR_JTAG_QUEUE_FAILED;
+	if (buffer)
+		free(buffer);
+	return retval;
+}
+
 static void cmsis_dap_execute_command(struct jtag_command *cmd)
 {
 	switch (cmd->type) {
@@ -959,8 +1121,18 @@ static void cmsis_dap_execute_command(struct jtag_command *cmd)
 		case JTAG_SLEEP:
 			cmsis_dap_execute_sleep(cmd);
 			break;
+		case JTAG_TLR_RESET:
+			cmsis_dap_execute_tlr_reset(cmd);
+			break;
+		case JTAG_SCAN:
+			cmsis_dap_execute_scan(cmd);
+			break;
+		case JTAG_RUNTEST:
+		case JTAG_PATHMOVE:
+		case JTAG_STABLECLOCKS:
+		case JTAG_TMS:
 		default:
-			LOG_ERROR("BUG: unknown JTAG command type encountered");
+			LOG_ERROR("BUG: unknown JTAG command type 0x%X encountered", cmd->type);
 			exit(-1);
 	}
 }
@@ -1011,6 +1183,7 @@ static int_least32_t cmsis_dap_swd_frequency(int_least32_t hz)
 
 	return hz;
 }
+
 
 COMMAND_HANDLER(cmsis_dap_handle_info_command)
 {
@@ -1116,7 +1289,7 @@ static const struct swd_driver cmsis_dap_swd_driver = {
 	.run = cmsis_dap_swd_run_queue,
 };
 
-static const char * const cmsis_dap_transport[] = { "swd", NULL };
+static const char * const cmsis_dap_transport[] = { "swd", "jtag", NULL };
 
 struct jtag_interface cmsis_dap_interface = {
 	.name = "cmsis-dap",
